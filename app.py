@@ -10,7 +10,8 @@ through the SAME features.engineer_features() as training, so the app cannot
 drift from the training pipeline.
 
 Tabs
-  1. Model comparison   test metrics, agreement, prediction vs actual
+  1. Model comparison   test metrics (all quotes and weekday-only), two baselines, the
+                        model without quote controls, implementation differences, prediction vs actual
   2. Training details   loss curves, learning-rate choice, the dummy-variable trap, coefficients
   3. Feature evidence   ablation, log vs raw target, grouped vs random split, rejected features
   4. Distributions      target and feature distributions, price by feature
@@ -41,14 +42,17 @@ ART = Path("artifacts")
 EXPERIMENTS_MD = Path("experiments/results.md")
 
 MODEL_LABELS = {
-    "baseline": "Baseline (district × room median)",
+    "baseline": "Baseline A: district × room type median",
+    "baseline_comps": "Baseline B: district × room type × guests median",
+    "ridge_no_dates": "Ridge without quote controls",
     "sklearn": "scikit-learn Ridge",
     "torch_manual": "PyTorch manual loop",
     "torch_nn": "PyTorch nn.Module + optim",
 }
 IMPLEMENTATIONS = ["sklearn", "torch_manual", "torch_nn"]
 # First three slots of a colour-blind-validated categorical palette, plus a neutral gray
-COLORS = {"baseline": "#8a8984", "sklearn": "#2a78d6", "torch_manual": "#eb6834", "torch_nn": "#1baf7a"}
+COLORS = {"baseline": "#8a8984", "baseline_comps": "#4a4946", "ridge_no_dates": "#9b6bd6",
+          "sklearn": "#2a78d6", "torch_manual": "#eb6834", "torch_nn": "#1baf7a"}
 INK, MUTED = "#0b0b0b", "#52514e"
 TEMPLATE = "plotly_white"
 
@@ -58,7 +62,7 @@ TEMPLATE = "plotly_white"
 # ----------------------------------------------------------------------------
 
 REQUIRED = ["preprocessor.joblib", "sklearn_ridge.joblib", "torch_manual.pt", "torch_nn.pt",
-            "baseline.json", "summary.json", "coefficients.csv", "test_predictions.csv",
+            "baseline.json", "baseline_comps.json", "summary.json", "coefficients.csv", "test_predictions.csv",
             "train_features.csv", "neighbourhoods.csv"]
 missing = [f for f in REQUIRED if not (ART / f).exists()]
 if missing:
@@ -72,6 +76,7 @@ nn_model = LinearRegressionModel(nn_state["linear.weight"].shape[1])
 nn_model.load_state_dict(nn_state)
 nn_model.eval()
 baseline = json.loads((ART / "baseline.json").read_text())
+baseline_comps = json.loads((ART / "baseline_comps.json").read_text())
 summary = json.loads((ART / "summary.json").read_text())
 coefs = pd.read_csv(ART / "coefficients.csv")
 test = pd.read_csv(ART / "test_predictions.csv")
@@ -93,11 +98,12 @@ def pct(x, d=1):
 # Tab 1: model comparison
 # ----------------------------------------------------------------------------
 
-def metrics_table() -> pd.DataFrame:
-    ci = summary["test_ci_95"]
+def metrics_table(weekday_only=False) -> pd.DataFrame:
+    suffix = "_weekday_only" if weekday_only else ""
+    ci, results = summary["test_ci_95" + suffix], summary["test_metrics" + suffix]
     rows = []
     for key, label in MODEL_LABELS.items():
-        m = summary["test_metrics"][key]
+        m = results[key]
         ci_key = key if key in ci else ("sklearn" if key in IMPLEMENTATIONS else None)
         band = ci[ci_key]["median_abs_pct_error"] if ci_key else None
         rows.append({
@@ -112,25 +118,64 @@ def metrics_table() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def comparison_md() -> str:
+    ci, ciw = summary["test_ci_95"], summary["test_ci_95_weekday_only"]
+    def gap(c, other):
+        d = c[f"sklearn_minus_{other}_median_abs_pct_error"]
+        return f"{pct(-d[1])} to {pct(-d[0])}"
+    n_wd = summary["split_sizes"]["test_weekday_only"]
+    return (
+        "### What the rows are\n"
+        "- **Baseline A** is the quick lookup a host does by hand: the median price of listings in the same district "
+        "with the same room type.\n"
+        "- **Baseline B** is a careful lookup: same district, same room type AND same number of guests (6 or more "
+        "pooled; groups under 5 listings fall back to Baseline A). Size is the strongest single feature, so this is "
+        "the baseline the model has to beat to be worth using.\n"
+        "- **Ridge without quote controls** is the final model minus the two date columns, same alpha. It shows what "
+        "accounting for the quoted dates is worth.\n"
+        "- The last three rows are the final model, trained three ways.\n\n"
+        "**Is the gain real?** The final model's median error is lower than Baseline A's by "
+        f"{gap(ci, 'baseline')}, than Baseline B's by {gap(ci, 'baseline_comps')}, and than the model without quote "
+        f"controls by {gap(ci, 'ridge_no_dates')} (95% intervals from resampling test hosts; none includes zero).\n\n"
+        f"**Weekday-only table.** The app always prices weeknights, so the second table scores only the {n_wd:,} test "
+        "quotes with no Friday or Saturday night in them. That is the error a host using the app should expect. "
+        f"On these quotes the final model beats Baseline B by {gap(ciw, 'baseline_comps')}."
+    )
+
+
 def agreement_md() -> str:
-    a, ci = summary["agreement"], summary["test_ci_95"]
-    diff = ci["sklearn_minus_baseline_median_abs_pct_error"]
+    a = summary["agreement"]
     return (
         "### Do the three implementations agree?\n"
         f"Yes. Largest coefficient gap: sklearn vs manual loop **{a['max_abs_coef_diff_manual_vs_sklearn']:.1e}**, "
         f"sklearn vs nn.Module **{a['max_abs_coef_diff_nn_vs_sklearn']:.1e}**. "
-        f"Largest prediction gap on the test set: **{a['max_abs_pred_diff_log_nn_vs_sklearn']:.1e}** in log price. "
         f"Final training objective: sklearn {a['train_objective_sklearn']:.7f}, "
         f"manual {a['train_objective_manual_final']:.7f}, nn.Module {a['train_objective_nn_final']:.7f}. "
+        "In euros, per test listing: the largest gap is "
+        f"€{a['max_abs_pred_diff_eur_manual_vs_sklearn']:.4f} (manual) and €{a['max_abs_pred_diff_eur_nn_vs_sklearn']:.4f} "
+        f"(nn.Module), the typical gap €{a['median_abs_pred_diff_eur_manual_vs_sklearn']:.5f}. "
         "Gaps of this size are float32 rounding in PyTorch versus float64 in sklearn, not a different solution. "
-        "The CI column is shared by the three implementations because their predictions are identical.\n\n"
-        f"**Model vs baseline:** the model's median error is {pct(-diff[1])} to {pct(-diff[0])} "
-        "lower than the baseline's (95% interval from resampling test hosts), so the gain is not luck of the split."
+        "This is why the three rows in the tables are identical and why they share one confidence interval. "
+        "The chart below shows every test listing's difference, because in the scatter plot the three sit on top "
+        "of each other."
     )
 
 
+def implementation_diff_plot():
+    fig = go.Figure()
+    for k in ["torch_manual", "torch_nn"]:
+        d = (test[f"pred_{k}_eur"] - test["pred_sklearn_eur"]) * 100   # cents
+        fig.add_trace(go.Histogram(x=d, name=f"{MODEL_LABELS[k]} − sklearn", nbinsx=60, opacity=0.6,
+                                   marker_color=COLORS[k],
+                                   hovertemplate="%{x:.3f} cents<br>%{y} listings<extra></extra>"))
+    fig.update_layout(barmode="overlay")
+    return style(fig, 340, title="Per-listing price difference from sklearn, test set (in euro CENTS)",
+                 xaxis_title="Prediction minus sklearn prediction (cents per night)", yaxis_title="Test listings",
+                 legend=dict(orientation="h", y=-0.3))
+
+
 def pred_vs_actual(choice: str):
-    keys = ["baseline"] + IMPLEMENTATIONS if choice == "All models" else [choice]
+    keys = ["baseline", "baseline_comps", "sklearn"] if choice == "All models" else [choice]
     fig = go.Figure()
     for k in keys:
         fig.add_trace(go.Scattergl(
@@ -141,7 +186,7 @@ def pred_vs_actual(choice: str):
     lo, hi = test["actual_eur"].min(), test["actual_eur"].max()
     fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="Perfect prediction",
                              line=dict(dash="dash", color=MUTED, width=2), hoverinfo="skip"))
-    note = (" (the three implementations overlap exactly: only the last one drawn is visible)"
+    note = (" (sklearn stands for all three implementations; see the difference chart above)"
             if choice == "All models" else "")
     ticks = [20, 50, 100, 200, 500, 1000, 2000]
     fig = style(fig, 560, title=f"Predicted vs actual nightly price, test set{note}",
@@ -486,12 +531,13 @@ def business_view(tolerance_pct: float, model_key: str):
         err = (test[f"pred_{k}_eur"] - test["actual_eur"]) / test["actual_eur"]
         shares[k] = float((err.abs() <= tol).mean())
     fig = go.Figure(go.Bar(
-        x=[MODEL_LABELS[k] for k in shares], y=list(shares.values()),
+        x=[MODEL_LABELS[k].replace(": ", ":<br>").replace(" + ", "<br>+ ") for k in shares], y=list(shares.values()),
         marker_color=[COLORS[k] for k in shares], text=[pct(v) for v in shares.values()], textposition="outside",
         hovertemplate="%{x}<br>%{y:.1%} within tolerance<extra></extra>",
     ))
     fig.update_yaxes(tickformat=".0%", range=[0, 1.05])
-    style(fig, 400, title=f"Share of test listings priced within ±{tolerance_pct:.0f}% of the real price",
+    fig.update_xaxes(tickangle=0, tickfont=dict(size=11))
+    style(fig, 420, title=f"Share of test listings priced within ±{tolerance_pct:.0f}% of the real price",
           yaxis_title="Share of listings")
 
     pred, actual = test[f"pred_{model_key}_eur"], test["actual_eur"]
@@ -566,11 +612,14 @@ def price_listing(nb_label, title, description, room_type, kind, accommodates, b
     # Price a reference stay: the host's minimum stay, on weekday nights and on Fri/Sat nights
     X, weekday = predict_all(reference_stay(listing, weekend=False))
     _, weekend = predict_all(reference_stay(listing, weekend=True))
-    base = baseline["table"].get(f"{nb.district}|{int(private)}", baseline["global_median"])
+    base_a = baseline["table"].get(f"{nb.district}|{int(private)}", baseline["global_median"])
+    guests = min(int(accommodates), 6)    # same grouping as pipeline.guest_group
+    base_b = baseline_comps["table"].get(f"{nb.district}|{int(private)}|{guests}", base_a)
     table = pd.DataFrame({
-        "Model": [MODEL_LABELS[k] for k in MODEL_LABELS],
-        "Weeknights €/night": [f"€{np.exp(base):.0f}"] + [f"€{np.exp(weekday[k]):.0f}" for k in IMPLEMENTATIONS],
-        "Fri/Sat (window average)": ["n/a"] + [f"€{np.exp(weekend[k]):.0f}" for k in IMPLEMENTATIONS],
+        "Model": [MODEL_LABELS[k] for k in ["baseline", "baseline_comps"] + IMPLEMENTATIONS],
+        "Weeknights €/night": [f"€{np.exp(base_a):.0f}", f"€{np.exp(base_b):.0f}"]
+                              + [f"€{np.exp(weekday[k]):.0f}" for k in IMPLEMENTATIONS],
+        "Fri/Sat (window average)": ["n/a", "n/a"] + [f"€{np.exp(weekend[k]):.0f}" for k in IMPLEMENTATIONS],
     })
     p, pw = np.exp(weekday["sklearn"]), np.exp(weekend["sklearn"])
     msg = (f"### Suggested base rate: €{p:.0f} per weeknight\n"
@@ -608,8 +657,14 @@ with gr.Blocks(title="Madrid Airbnb pricing") as demo:
     gr.Markdown(INTRO)
 
     with gr.Tab("Model comparison"):
+        gr.Markdown("### Test set, all quotes")
         gr.Dataframe(metrics_table(), interactive=False, wrap=True)
+        gr.Markdown(f"### Test set, weekday-only quotes ({summary['split_sizes']['test_weekday_only']:,} listings): "
+                    "what the app's suggestion is scored on")
+        gr.Dataframe(metrics_table(weekday_only=True), interactive=False, wrap=True)
+        gr.Markdown(comparison_md())
         gr.Markdown(agreement_md())
+        gr.Plot(implementation_diff_plot())
         choice = gr.Dropdown([("All models", "All models")] + [(v, k) for k, v in MODEL_LABELS.items()],
                              value="All models",
                              label="Model(s) in the prediction vs actual plot")

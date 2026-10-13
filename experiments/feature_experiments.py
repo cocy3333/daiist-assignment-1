@@ -46,7 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import features as F  # noqa: E402
-import train as T  # noqa: E402
+import pipeline as T  # noqa: E402
 
 ALPHA = 0.1                 # same ridge strength as the final model
 MIN_GAIN = 0.001            # rule part b

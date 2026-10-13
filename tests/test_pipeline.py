@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 import clean_data as C  # noqa: E402
 import features as F  # noqa: E402
-import train as T  # noqa: E402
+import pipeline as T  # noqa: E402
 
 
 def raw_row(**overrides):
