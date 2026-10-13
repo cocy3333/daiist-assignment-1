@@ -1,0 +1,12 @@
+{
+  "raw_rows": 22708,
+  "dropped_no_price": 3536,
+  "dropped_long_stay_quote": 4095,
+  "dropped_room_type_out_of_scope": 164,
+  "dropped_implausible_price": 190,
+  "dropped_no_coordinates": 0,
+  "final_rows": 14723,
+  "private_room_bedrooms_blank_set_to_1": 2363,
+  "private_room_bedrooms_over_1_set_to_1": 190,
+  "fixed_entire_home_zero_baths": 61
+}

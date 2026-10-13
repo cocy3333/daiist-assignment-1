@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 *.pyc
+data_raw/
+
+# original 59 MB download; the repo uses the compressed copy in data/raw/
+airbib_list.csv
